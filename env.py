@@ -1,5 +1,6 @@
+import logging
 import gymnasium as gym
-from consts import Direction, ItemType, Map, TeamColor, Terrain
+from consts import Direction, ItemType, Map, PlayerState, TeamColor, Terrain
 import numpy as np
 from utils import log_exec_time
 
@@ -47,6 +48,7 @@ class ObservationSpaceManager:
         Terrain.SPEED_UP: 1,
         Terrain.SPEED_DOWN: 2,
         Terrain.OBSTACLE: 3,
+        Terrain.NOOP: 3,
         Terrain.DESTROYABLE_OBSTACLE: 4,
     }
 
@@ -101,7 +103,7 @@ class ObservationSpaceManager:
         self._handle_bombs(game_state, observation_space)
 
         # 根据 my_player 和 other_players => 确定 所有玩家层
-        self._handle_players(game_state, observation_space, self_team)
+        self._handle_players(game_state, observation_space)
 
         return observation_space
 
@@ -125,67 +127,16 @@ class ObservationSpaceManager:
             assert v > 0 and v <= 1
             return v
 
-        def _cascade_trigger_bomb(bomb: dict, expect_explode_at: int):
-            """
-            级联触发炸弹
-            1. 将当前炸弹爆炸范围内的所有格赋值为 _normalize_explode_value(explode_at - current_tick)
-            1.1 如果某些格的值更小（不包括初始值 0），则说明其更早就会被炸，无需再赋值
-            2. 如果爆炸范围内有其它炸弹，且其爆炸时间更久，则要立即触发该炸弹
-            """
-            bomb_x, bomb_y = bomb["position"]["x"], bomb["position"]["y"]
+        def on_explode(grid_x, grid_y, tick):
+            observation_space[self.BOMB_LAYER_BEGIN_INDEX, grid_y, grid_x] = (
+                _compute_explode_value(tick)
+            )
 
-            # 如果炸弹所在位置爆炸值不为 0 且更小，则说明已被触发过
-            explode_value_at_bomb_pos = observation_space[
-                self.BOMB_LAYER_BEGIN_INDEX, bomb_y, bomb_x
-            ]
-            if (
-                explode_value_at_bomb_pos != 0
-                and explode_value_at_bomb_pos
-                <= _compute_explode_value(expect_explode_at)
-            ):
-                return
-
-            explode_value = _compute_explode_value(expect_explode_at)
-
-            # 遍历爆炸范围内的所有格子，进行爆炸值的更新
-            for dy in range(-bomb["range"], bomb["range"] + 1):
-                for dx in range(-bomb["range"], bomb["range"] + 1):
-                    # 十字形爆炸
-                    if (abs(dx) + abs(dy)) > bomb["range"]:
-                        continue
-
-                    explode_x, explode_y = bomb_x + dx, bomb_y + dy
-                    if 0 <= explode_x < Map.WIDTH and 0 <= explode_y < Map.HEIGHT:
-                        cur_explode_value = observation_space[
-                            self.BOMB_LAYER_BEGIN_INDEX, explode_y, explode_x
-                        ]
-                        if cur_explode_value == 0 or cur_explode_value > explode_value:
-                            observation_space[
-                                self.BOMB_LAYER_BEGIN_INDEX, explode_y, explode_x
-                            ] = explode_value
-                        # 如果当前爆炸的位置有炸弹，且其爆炸事件更晚，则提前将其触发
-                        postion_key = f"{explode_y}_{explode_x}"
-                        if postion_key in position_bomb_dict:
-                            target_bomb = position_bomb_dict[postion_key]
-                            if target_bomb["explode_at"] > expect_explode_at:
-                                _cascade_trigger_bomb(target_bomb, expect_explode_at)
-
-        # 遍历触发所有炸弹，如果某个炸弹被之前的炸弹级联触发，这里的触发应该会被跳过
-        for bomb in game_state["bombs"]:
-            _cascade_trigger_bomb(bomb, bomb["explode_at"])
+        _dfs_bomb(game_state, on_explode)
 
     @log_exec_time
-    def _handle_players(self, game_state, observation_space, self_team):
-        all_players = [None] * 4
-        # 确保己方角色处于前两位，且队内按 id 升序
-        all_players[1 if game_state["my_player"]["id"] >= 3 else 0] = game_state[
-            "my_player"
-        ]
-        for player in game_state["other_players"]:
-            if player["team"] == self_team:
-                all_players[0 if all_players[0] is None else 1] = player
-            else:
-                all_players[2 if player["id"] >= 3 else 3] = player
+    def _handle_players(self, game_state, observation_space):
+        all_players = _get_sorted_all_players(game_state)
         # 与玩家重叠的格子，按照重叠部分大小赋值
         # 完全重叠为 1.0，完全不重叠为 0.0
         for i, player in enumerate(all_players):
@@ -206,6 +157,30 @@ class ObservationSpaceManager:
                     observation_space[
                         self.PLAYER_LAYER_BEGIN_INDEX + i, grid_y, grid_x
                     ] = collapse_area / (Map.BLOCK_SIZE**2)
+
+    def render(self, observation_space):
+        result = ""
+
+        value_fmt = "{:.2f}"
+        cell_width = 7
+
+        layer_num, H, W = observation_space.shape
+        row_idx_width = max(2, len(str(H - 1)))
+
+        for i in range(layer_num):
+            result += f"=== {self.LAYERS[i]} ===\n"
+            for y in range(H):
+                row_img = " ".join(
+                    value_fmt.format(float(observation_space[i, y, x])).rjust(
+                        cell_width
+                    )
+                    for x in range(W)
+                )
+                result += f"{str(y).rjust(row_idx_width)}: {row_img}\n"
+
+            result += "\n"
+
+        return result
 
 
 observation_space_manager = ObservationSpaceManager()
@@ -228,13 +203,14 @@ class ActionSpaceManager:
 
     def describe(self):
         action_discrete_size = len(self.ACTIONS)
+        # 将两个角色的动作组合成为 多头动作，这样既能学习到两个角色的协作，又能一次推理输出两个角色的动作
         return gym.spaces.MultiDiscrete([action_discrete_size, action_discrete_size])
 
-    def decode_action(self, action_value: int):
+    def decode_single_action(self, action_value: int):
         return self.ACTIONS[action_value]
 
-    def encode_action(self, action: dict):
-        for i, a in self.ACTIONS:
+    def encode_single_action(self, action: dict):
+        for i, a in enumerate(self.ACTIONS):
             if (
                 a["direction"] == action["direction"]
                 and a["is_place_bomb"] == action["is_place_bomb"]
@@ -244,6 +220,97 @@ class ActionSpaceManager:
 
 
 action_space_manager = ActionSpaceManager()
+
+
+class RewardManager:
+    W_OCCUPY = 15 / Map.WIDTH / Map.HEIGHT
+    W_STUN = -1
+    W_DESTROY_OBSTACLE = 12 / Map.WIDTH / Map.HEIGHT
+    W_WIN = 4
+    W_LOSE = -4
+
+    @log_exec_time
+    def compute_reward(
+        self, prev_game_state, cur_game_state, game_result: bool | None = None
+    ):
+        if prev_game_state is None:
+            return 0
+
+        # 结果奖励
+        result_reward = 0
+        if game_result is not None:
+            result_reward = self.W_WIN if game_result else self.W_LOSE
+
+        self_team = cur_game_state["my_player"]["team"]
+
+        # 占领奖励
+        prev_occupied_grids = _count_occupied_grids(prev_game_state, self_team)
+        cur_occupied_grids = _count_occupied_grids(cur_game_state, self_team)
+        occupy_reward = (cur_occupied_grids - prev_occupied_grids) * self.W_OCCUPY
+
+        # 眩晕惩罚
+        stun_reward = 0
+        prev_all_players = _get_sorted_all_players(prev_game_state)
+        cur_all_players = _get_sorted_all_players(cur_game_state)
+        for i in range(2):
+            if (
+                prev_all_players[i]["status"] == PlayerState.GOOD
+                and cur_all_players[i]["status"] == PlayerState.BAD
+            ):
+                stun_reward += self.W_STUN
+
+        # 破坏障碍物奖励
+        destroy_obstacle_reward = self._compute_destroy_obstacle_reward(
+            prev_game_state, cur_game_state, self_team
+        )
+
+        total_reward = (
+            result_reward + occupy_reward + stun_reward + destroy_obstacle_reward
+        )
+
+        return total_reward, {
+            "result_reward": result_reward,
+            "occupy_reward": occupy_reward,
+            "stun_reward": stun_reward,
+            "destroy_obstacle_reward": destroy_obstacle_reward,
+        }
+
+    @log_exec_time
+    def _compute_destroy_obstacle_reward(
+        self, prev_game_state, cur_game_state, self_team
+    ) -> float:
+        destroy_obstacle_reward = 0
+        # 遍历上一帧的己方的所有炸弹，如果其爆炸范围里有“可破坏障碍物”且这一帧变成平地了，就认为破坏了障碍物
+        # TODO 暂不考虑级联爆炸
+        for bomb in prev_game_state["bombs"]:
+            if bomb["team"] == self_team:
+                bomb_x, bomb_y = bomb["position"]["x"], bomb["position"]["y"]
+                directions = [
+                    (0, 1),
+                    (0, -1),
+                    (1, 0),
+                    (-1, 0),
+                ]
+                for dx, dy in directions:
+                    for i in range(1, bomb["range"] + 1):
+                        grid_x, grid_y = bomb_x + dx * i, bomb_y + dy * i
+                        if not (0 <= grid_x < Map.WIDTH and 0 <= grid_y < Map.HEIGHT):
+                            break
+                        terrain = prev_game_state["map"][grid_y][grid_x]["terrain"]
+                        if terrain == Terrain.OBSTACLE:
+                            break
+                        if terrain == Terrain.DESTROYABLE_OBSTACLE:
+                            if (
+                                cur_game_state["map"][grid_y][grid_x]["terrain"]
+                                == Terrain.PLAIN
+                            ):
+                                destroy_obstacle_reward += self.W_DESTROY_OBSTACLE
+                            break
+
+        return destroy_obstacle_reward
+
+
+reward_manager = RewardManager()
 
 
 def _is_in_grid_center(x_or_y: int) -> bool:
@@ -267,3 +334,114 @@ def _compute_collapse_grid(x_or_y: int) -> list[int]:
             (x_or_y - (Map.BLOCK_SIZE // 2)) // Map.BLOCK_SIZE,
             (x_or_y + (Map.BLOCK_SIZE // 2)) // Map.BLOCK_SIZE,
         ]
+
+
+def _count_occupied_grids(game_state, self_team) -> int:
+    """
+    统计当前游戏状态下，当前队伍占领的格子数量
+    """
+    count = 0
+    for row in game_state["map"]:
+        for grid in row:
+            if grid["ownership"] == self_team:
+                count += 1
+    return count
+
+
+def _get_sorted_all_players(game_state) -> list[dict]:
+    """
+    获取当前游戏状态下的所有玩家，先己方后敌方，队内按照 id 升序
+    """
+    self_team = game_state["my_player"]["team"]
+    all_players = [None] * 4
+
+    all_players[(game_state["my_player"]["id"] - 1) // 2] = game_state["my_player"]
+
+    for player in game_state["other_players"]:
+        if player["team"] == self_team:
+            all_players[(player["id"] - 1) // 2] = player
+        else:
+            all_players[2 + ((player["id"] - 1) // 2)] = player
+    return all_players
+
+
+@log_exec_time
+def _dfs_bomb(game_state, on_explode):
+    """
+    对所有爆炸可能影响到的位置执行 on_explode(x, y, tick)
+    考虑 障碍阻挡 和 级联爆炸；若某格可能在多个时刻被炸，只在最早的 tick 触发一次 on_explode
+    """
+    position_bomb_dict = {}
+    for bomb in game_state["bombs"]:
+        position_bomb_dict[(bomb["position"]["x"], bomb["position"]["y"])] = bomb
+    # 记录 (x, y) -> 最早爆炸时间
+    affected_grid_tick_dict = {}
+
+    def _record_affect(grid_pos: tuple[int, int], tick: int):
+        if (
+            grid_pos not in affected_grid_tick_dict
+            or affected_grid_tick_dict[grid_pos] > tick
+        ):
+            affected_grid_tick_dict[grid_pos] = tick
+
+    def _propagate_from_bomb(bomb: dict, tick: int):
+        bomb_x, bomb_y = bomb["position"]["x"], bomb["position"]["y"]
+        # 若炸弹在更早的时间已经爆炸，则无需再次处理
+        if (
+            bomb_x,
+            bomb_y,
+        ) in affected_grid_tick_dict and tick >= affected_grid_tick_dict[
+            (bomb_x, bomb_y)
+        ]:
+            return
+        # 炸弹所在格被炸
+        _record_affect((bomb_x, bomb_y), tick)
+        # 十字传播
+        directions = [
+            (0, 1),
+            (0, -1),
+            (1, 0),
+            (-1, 0),
+        ]
+        for dx, dy in directions:
+            for i in range(1, bomb["range"] + 1):
+                grid_x, grid_y = bomb_x + dx * i, bomb_y + dy * i
+                # 超出地图范围
+                if not (0 <= grid_x < Map.WIDTH and 0 <= grid_y < Map.HEIGHT):
+                    break
+                terrain = game_state["map"][grid_y][grid_x]["terrain"]
+                # 遇到障碍，不被炸，且被阻挡
+                if terrain == Terrain.OBSTACLE:
+                    break
+                # 遇到可摧毁障碍，被炸，但被阻挡
+                if terrain == Terrain.DESTROYABLE_OBSTACLE:
+                    _record_affect((grid_x, grid_y), tick)
+                    break
+                # 其它情况，被炸，且不被阻挡，并有可能级联爆炸
+                _record_affect((grid_x, grid_y), tick)
+                if (grid_x, grid_y) in position_bomb_dict:
+                    _propagate_from_bomb(position_bomb_dict[(grid_x, grid_y)], tick)
+
+    for bomb in game_state["bombs"]:
+        _propagate_from_bomb(bomb, bomb["explode_at"])
+
+    for grid_pos, tick in affected_grid_tick_dict.items():
+        on_explode(*grid_pos, tick)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        filename="./outputs/env.log", encoding="utf-8", level=logging.INFO
+    )
+    import json
+
+    with open("./outputs/game_states_example.json", "r", encoding="utf-8") as f:
+        game_states = json.load(f)
+        for game_state in game_states:
+            observation_space = observation_space_manager.from_game_state(game_state)
+            logging.info(observation_space_manager.render(observation_space))
+
+        reward, reward_detail = reward_manager.compute_reward(
+            game_states[0], game_states[1]
+        )
+        logging.info({"reward": reward, "reward_detail": reward_detail})

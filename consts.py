@@ -31,6 +31,7 @@ class Terrain:
     SPEED_UP = "B"
     SPEED_DOWN = "M"
     OBSTACLE = "I"
+    NOOP = "N"
     DESTROYABLE_OBSTACLE = "D"
 
 
