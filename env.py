@@ -3,6 +3,8 @@ import gymnasium as gym
 from consts import Direction, ItemType, Map, PlayerState, TeamColor, Terrain
 import numpy as np
 from utils import log_exec_time
+from typing import Any
+from game_manager import GameManager
 
 
 class SugarFightEnv(gym.Env):
@@ -12,6 +14,64 @@ class SugarFightEnv(gym.Env):
         self.server_exe_path = server_exe_path
         self.observation_space = observation_space_manager.describe()
         self.action_space = action_space_manager.describe()
+
+    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        super().reset(seed=seed, options=options)
+        if self._game_manager is not None:
+            try:
+                self._game_manager.__exit__()
+            except Exception:
+                logging.exception("game_manager_exit_err")
+            finally:
+                self._game_manager = None
+
+        self._game_manager = GameManager(self.server_exe_path, id=0)
+        self._game_manager.__enter__()
+
+        first_game_state, tick = self._game_manager.start_game()
+        assert tick == 1
+
+        obs = observation_space_manager.from_game_state(first_game_state)
+        info = {
+            "game_state": first_game_state,
+        }
+
+        self._prev_game_state = None
+        self._cur_game_state = first_game_state
+        self._cur_tick = tick
+
+        return obs, info
+
+    def step(self, action):
+        commands = [action_space_manager.encode_command(v) for v in action]
+        self._game_manager.dispatch_commands(commands, self._cur_tick)
+
+        next_game_state, tick, game_result = self._game_manager.wait_for_game_state(
+            self._cur_tick + 1
+        )
+        # ! 时序不一致直接抛出异常，前期先以排错为主
+        assert tick == self._cur_tick + 1
+
+        next_obs = observation_space_manager.from_game_state(next_game_state)
+        reward, reward_detail = reward_manager.compute_reward(
+            self._cur_game_state, next_game_state, game_result
+        )
+
+        # done = game_result is not None
+        # TODO 先用 tick 自行判断是否结束
+        done = tick >= GameManager.GAME_DURATION
+
+        info = {
+            "commands": commands,
+            "next_game_state": next_game_state,
+            "reward_detail": reward_detail,
+        }
+
+        self._prev_game_state = self._cur_game_state
+        self._cur_game_state = next_game_state
+        self._cur_tick = tick
+
+        return next_obs, reward, done, False, info
 
 
 class ObservationSpaceManager:
@@ -188,7 +248,7 @@ observation_space_manager = ObservationSpaceManager()
 
 class ActionSpaceManager:
     # 取 方向 + 是否放置炸弹 的 笛卡尔积 作为离散动作空间
-    ACTIONS = [
+    COMMANDS = [
         {"direction": Direction.NOOP, "is_place_bomb": False},
         {"direction": Direction.UP, "is_place_bomb": False},
         {"direction": Direction.DOWN, "is_place_bomb": False},
@@ -202,21 +262,21 @@ class ActionSpaceManager:
     ]
 
     def describe(self):
-        action_discrete_size = len(self.ACTIONS)
+        action_discrete_size = len(self.COMMANDS)
         # 将两个角色的动作组合成为 多头动作，这样既能学习到两个角色的协作，又能一次推理输出两个角色的动作
         return gym.spaces.MultiDiscrete([action_discrete_size, action_discrete_size])
 
-    def decode_single_action(self, action_value: int):
-        return self.ACTIONS[action_value]
+    def encode_command(self, action: int):
+        return self.COMMANDS[action]
 
-    def encode_single_action(self, action: dict):
-        for i, a in enumerate(self.ACTIONS):
+    def decode_command(self, command: dict):
+        for i, c in enumerate(self.COMMANDS):
             if (
-                a["direction"] == action["direction"]
-                and a["is_place_bomb"] == action["is_place_bomb"]
+                c["direction"] == command["direction"]
+                and c["is_place_bomb"] == command["is_place_bomb"]
             ):
                 return i
-        raise ValueError(f"encode_action_err: action={action}")
+        raise ValueError(f"encode_action_err: action={command}")
 
 
 action_space_manager = ActionSpaceManager()
@@ -269,6 +329,7 @@ class RewardManager:
         )
 
         return total_reward, {
+            "total_reward": total_reward,
             "result_reward": result_reward,
             "occupy_reward": occupy_reward,
             "stun_reward": stun_reward,
