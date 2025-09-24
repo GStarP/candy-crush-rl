@@ -2,13 +2,13 @@ import os
 import json
 import logging
 import time
-from fastapi import FastAPI, Request
 import multiprocessing
 import subprocess
 import asyncio
 import uvicorn
 import random
 from consts import Direction
+from utils import configure_logging
 
 
 class GameManager:
@@ -18,30 +18,23 @@ class GameManager:
     GAME_DURATION = 3 * 60 * 10
     DEFAULT_COMMAND = {"direction": Direction.NOOP, "is_place_bomb": False}
 
-    def __init__(self, server_exe_path: str, id: int, debug=False):
+    def __init__(
+        self, server_exe_path: str, id: int, work_dir: str, debug=False, seed=1
+    ):
         self.server_exe_path = os.path.abspath(server_exe_path)
         self.id = id
+        self.work_dir = work_dir
         self.debug = debug
+        self.seed = seed
 
-        self.work_dir = f"./temp/game_{self.id}"
         self.player_server_port = 8000 + self.id
 
-    def __enter__(self):
+    def init(self):
         self.shared_game_state_queue = multiprocessing.Queue()
         self.shared_commands_queue = multiprocessing.Queue()
 
-        # 创建临时目录
-        os.makedirs(self.work_dir, exist_ok=True)
-        # 配置日志
-        logging.basicConfig(
-            filename=os.path.join(self.work_dir, "game_manager.log"),
-            encoding="utf-8",
-            level=logging.DEBUG if self.debug else logging.INFO,
-            format="%(asctime)s.%(msecs)03d %(levelname)s [pid=%(process)d] %(name)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
         # 创建配置文件
-        config = self._create_config(player_server_port=self.player_server_port)
+        config = self._create_config()
         with open(
             os.path.join(self.work_dir, "config.json"), "w", encoding="utf-8"
         ) as f:
@@ -67,7 +60,7 @@ class GameManager:
 
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def clean(self):
         # 停止游戏服务
         if self.game_server_process:
             try:
@@ -111,20 +104,20 @@ class GameManager:
         self.shared_commands_queue.put((tick, commands))
         logging.debug(f"dispatch_commands: tick={tick}, commands={commands}")
 
-    def _create_config(self, player_server_port: int):
+    def _create_config(self):
         return {
-            "seed": 1,
+            "seed": self.seed,
             "teams": [
                 {
                     "team_name": self.TEAM_NAME,
                     "players": [
                         {
                             "player_name": self.PLAYER1_NAME,
-                            "ip_port": f"127.0.0.1:{player_server_port}",
+                            "ip_port": f"127.0.0.1:{self.player_server_port}",
                         },
                         {
                             "player_name": self.PLAYER2_NAME,
-                            "ip_port": f"127.0.0.1:{player_server_port}",
+                            "ip_port": f"127.0.0.1:{self.player_server_port}",
                         },
                     ],
                 },
@@ -147,21 +140,29 @@ def _run_player_server_in_subprocess(
     debug=False,
     wait_timeout=0.07,
 ):
-    logging.basicConfig(
-        filename=os.path.join(work_dir, "game_manager.log"),
-        encoding="utf-8",
-        level=logging.DEBUG if debug else logging.INFO,
-        format="%(asctime)s.%(msecs)03d %(levelname)s [pid=%(process)d] %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    from fastapi import FastAPI, Request
+    from contextlib import asynccontextmanager
 
-    player_server = FastAPI()
-    player_server.state.current_tick = 0
+    configure_logging(work_dir, debug=debug)
 
     real_interactions = [
         {"game_state": None, "commands": [None, None]}
         for _ in range(GameManager.GAME_DURATION + 2)
     ]
+
+    def dump_real_interactions():
+        with open(
+            os.path.join(work_dir, "real_interactions.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(real_interactions, f, ensure_ascii=False, indent=2)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        dump_real_interactions()
+
+    player_server = FastAPI(lifespan=lifespan)
+    player_server.state.current_tick = 0
 
     commands_event_list = [
         {
@@ -234,15 +235,12 @@ def _run_player_server_in_subprocess(
 
         return commands[commands_index]
 
-    uvicorn.run(player_server, host="0.0.0.0", port=port)
-
-    with open(
-        os.path.join(work_dir, "real_interactions.json"), "w", encoding="utf-8"
-    ) as f:
-        json.dump(real_interactions, f, ensure_ascii=False, indent=2)
+    uvicorn.run(player_server, host="0.0.0.0", port=port, log_level="warning")
 
 
 if __name__ == "__main__":
+    work_dir = "./temp/test_game_manager"
+    configure_logging(work_dir, debug=True)
 
     def mock_compute():
         commands = []
@@ -260,9 +258,11 @@ if __name__ == "__main__":
             commands.append({"direction": direction, "is_place_bomb": is_place_bomb})
         return commands
 
-    with GameManager(
-        server_exe_path="./game/server.exe", id=1, debug=True
-    ) as game_manager:
+    game_manager = GameManager(
+        server_exe_path="./game/server.exe", id=1, work_dir=work_dir, debug=True
+    )
+    try:
+        game_manager.init()
         cur_tick = 1
 
         game_state, tick = game_manager.start_game()
@@ -276,3 +276,5 @@ if __name__ == "__main__":
                 tick=cur_tick
             )
             assert tick == cur_tick
+    finally:
+        game_manager.clean()

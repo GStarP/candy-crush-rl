@@ -1,32 +1,54 @@
 import logging
+import random
 import gymnasium as gym
 from consts import Direction, ItemType, Map, PlayerState, TeamColor, Terrain
 import numpy as np
-from utils import log_exec_time
+from utils import configure_logging, log_exec_time
 from typing import Any
 from game_manager import GameManager
+import os
 
 
 class SugarFightEnv(gym.Env):
-    def __init__(self, server_exe_path: str):
+    def __init__(self, server_exe_path: str, id: int, work_dir: str, debug=False):
         super().__init__()
 
         self.server_exe_path = server_exe_path
+        self.id = id
+        self.work_dir = os.path.join(work_dir, f"game_{self.id}")
+        os.makedirs(self.work_dir, exist_ok=True)
+        self.debug = debug
+
         self.observation_space = observation_space_manager.describe()
         self.action_space = action_space_manager.describe()
 
-    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        self._game_manager = None
+
+        configure_logging(self.work_dir, debug=debug)
+
+    def reset(
+        self,
+        *,
+        seed: int = random.randint(0, 2**16 - 1),
+        options: dict[str, Any] | None = None,
+    ):
         super().reset(seed=seed, options=options)
         if self._game_manager is not None:
             try:
-                self._game_manager.__exit__()
+                self._game_manager.clean()
             except Exception:
                 logging.exception("game_manager_exit_err")
             finally:
                 self._game_manager = None
 
-        self._game_manager = GameManager(self.server_exe_path, id=0)
-        self._game_manager.__enter__()
+        self._game_manager = GameManager(
+            self.server_exe_path,
+            id=self.id,
+            seed=seed,
+            work_dir=self.work_dir,
+            debug=self.debug,
+        )
+        self._game_manager.init()
 
         first_game_state, tick = self._game_manager.start_game()
         assert tick == 1
@@ -72,6 +94,13 @@ class SugarFightEnv(gym.Env):
         self._cur_tick = tick
 
         return next_obs, reward, done, False, info
+
+    def close(self):
+        if self._game_manager is not None:
+            try:
+                self._game_manager.clean()
+            finally:
+                self._game_manager = None
 
 
 class ObservationSpaceManager:
@@ -184,7 +213,11 @@ class ObservationSpaceManager:
             爆炸时间为 2s 即 20 ticks
             """
             v = (explode_at - current_tick) / 20.0
-            assert v > 0 and v <= 1
+            if v <= 0 or v > 1:
+                logging.warning(
+                    f"invalid_explode_value: explode_at={explode_at}, current_tick={current_tick}"
+                )
+                return 0.0 if v <= 0 else 1.0
             return v
 
         def on_explode(grid_x, grid_y, tick):
