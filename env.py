@@ -29,7 +29,7 @@ class SugarFightEnv(gym.Env):
     def reset(
         self,
         *,
-        seed: int = random.randint(0, 2**16 - 1),
+        seed: int | None = None,
         options: dict[str, Any] | None = None,
     ):
         super().reset(seed=seed, options=options)
@@ -44,7 +44,7 @@ class SugarFightEnv(gym.Env):
         self._game_manager = GameManager(
             self.server_exe_path,
             id=self.id,
-            seed=seed,
+            seed=seed or random.randint(0, 2**16 - 1),
             work_dir=self.work_dir,
             debug=self.debug,
         )
@@ -65,6 +65,9 @@ class SugarFightEnv(gym.Env):
         return obs, info
 
     def step(self, action):
+        if self._game_manager is None:
+            raise RuntimeError("step_err: game_manager_is_none")
+
         commands = [action_space_manager.encode_command(v) for v in action]
         self._game_manager.dispatch_commands(commands, self._cur_tick)
 
@@ -213,11 +216,11 @@ class ObservationSpaceManager:
             爆炸时间为 2s 即 20 ticks
             """
             v = (explode_at - current_tick) / 20.0
-            if v <= 0 or v > 1:
+            if v < 0 or v > 1:
                 logging.warning(
                     f"invalid_explode_value: explode_at={explode_at}, current_tick={current_tick}"
                 )
-                return 0.0 if v <= 0 else 1.0
+                return 0.0 if v < 0 else 1.0
             return v
 
         def on_explode(grid_x, grid_y, tick):
@@ -327,7 +330,7 @@ class RewardManager:
         self, prev_game_state, cur_game_state, game_result: bool | None = None
     ):
         if prev_game_state is None:
-            return 0
+            return 0, {}
 
         # 结果奖励
         result_reward = 0
@@ -447,7 +450,7 @@ def _get_sorted_all_players(game_state) -> list[dict]:
     获取当前游戏状态下的所有玩家，先己方后敌方，队内按照 id 升序
     """
     self_team = game_state["my_player"]["team"]
-    all_players = [None] * 4
+    all_players = [{}] * 4
 
     all_players[(game_state["my_player"]["id"] - 1) // 2] = game_state["my_player"]
 

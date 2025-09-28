@@ -11,7 +11,8 @@ def log_exec_time(func):
         result = func(*args, **kwargs)
         end_time = time.perf_counter()
         cost = end_time - start_time
-        logging.info(f"log_exec_time： func={func.__name__}, cost={cost:.4f}s")
+        if cost >= 0.01:
+            logging.warning(f"log_exec_time： func={func.__name__}, cost={cost:.4f}s")
         return result
 
     return wrapper

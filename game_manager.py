@@ -90,7 +90,7 @@ class GameManager:
     def start_game(self):
         # TODO 发送游戏开始信令
         game_state, tick, _game_result = self.wait_for_game_state(
-            tick=1, wait_timeout=60
+            tick=1, wait_timeout=300
         )
         return game_state, tick
 
