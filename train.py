@@ -66,8 +66,9 @@ if __name__ == "__main__":
     SEED = 42
     DEBUG = False
     RESUME_MODEL_PATH = (
-        "./temp/train_20250928_190419/models/ppo_sugarfight_ckpt_5400_steps.zip"
+        "./temp/train_20250929_155551/models/ppo_sugarfight_ckpt_91800_steps.zip"
     )
+    TOTAL_STEPS = 54000
 
     work_dir = f"./temp/train_{time.strftime('%Y%m%d_%H%M%S', time.localtime())}"
     os.makedirs(work_dir, exist_ok=True)
@@ -120,7 +121,7 @@ if __name__ == "__main__":
     model.predict(env.observation_space.sample(), deterministic=False)
 
     model.learn(
-        total_timesteps=9000,
+        total_timesteps=TOTAL_STEPS,
         progress_bar=True,
         callback=[checkpoint_callback],
         reset_num_timesteps=reset_num_timesteps,

@@ -88,6 +88,7 @@ class GameManager:
                 logging.exception(f"close_commands_queue_error: {e}")
 
     def start_game(self):
+        self.game_server_api.relaunch_game_server()
         # 向游戏服务器发送一系列信令从而开始游戏
         self.game_server_api.start_new_game()
 
