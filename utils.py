@@ -26,3 +26,13 @@ def configure_logging(work_dir: str, debug=False):
         format="%(asctime)s.%(msecs)03d %(levelname)s [pid=%(process)d] %(filename)s:%(lineno)d - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def windows_notify(title: str, msg: str):
+    from win10toast_persist import ToastNotifier
+
+    try:
+        toaster = ToastNotifier()
+        toaster.show_toast(title, msg, duration=10, threaded=True)
+    except Exception as e:
+        logging.exception(f"windows_notify_error: {e}")
