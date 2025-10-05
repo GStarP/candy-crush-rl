@@ -2,6 +2,8 @@ from dataclasses import dataclass
 
 GAME_TOTAL_TICKS = 3 * 60 * 10
 
+BOMB_DELAY = 20
+
 
 @dataclass
 class TeamColor:

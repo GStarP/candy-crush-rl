@@ -74,7 +74,10 @@ class SugarFightEnv(gym.Env):
 
         next_obs = observation_space_manager.from_game_state(next_game_state)
         reward, reward_detail = reward_manager.compute_reward(
-            self._cur_game_state, next_game_state, game_result
+            prev_game_state=self._cur_game_state,
+            cur_game_state=next_game_state,
+            reward_type=RewardManager.RewardType.EARLY,
+            game_result=game_result,
         )
         done = game_result is not None
 

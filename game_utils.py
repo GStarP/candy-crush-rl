@@ -1,9 +1,11 @@
+from dataclasses import dataclass
 import logging
 from consts import Direction, ItemType, Map, PlayerState, TeamColor, Terrain
 import numpy as np
 import gymnasium as gym
 
 from utils import log_exec_time
+from consts import BOMB_DELAY
 
 
 class ObservationSpaceManager:
@@ -115,13 +117,14 @@ class ObservationSpaceManager:
             归一化爆炸值
             爆炸时间为 2s 即 20 ticks
             """
-            v = (explode_at - current_tick) / 20.0
-            if v < 0 or v > 1:
-                logging.warning(
-                    f"invalid_explode_value: explode_at={explode_at}, current_tick={current_tick}"
-                )
-                return 0.0 if v < 0 else 1.0
-            return v
+
+            v = explode_at - current_tick
+            if v < 0:
+                v = 0
+            if v > 20:
+                v = 20
+            # ! v 位于 [0, 20]，要将其转换到 [0.5, 1]
+            return 1.0 - (v / 40)
 
         def on_explode(grid_x, grid_y, tick):
             observation_space[self.BOMB_LAYER_BEGIN_INDEX, grid_y, grid_x] = (
@@ -213,30 +216,44 @@ class ActionSpaceManager:
 
 
 class RewardManager:
-    W_OCCUPY = 15 / Map.WIDTH / Map.HEIGHT
+    W_OCCUPY = 0.5
     W_STUN = -1
-    W_DESTROY_OBSTACLE = 12 / Map.WIDTH / Map.HEIGHT
-    W_WIN = 4
-    W_LOSE = -4
+    W_DESTROY_OBSTACLE = 3
+    W_WIN = 10
+    W_LOSE = -5
+    W_PLACE_GOOD_BOMB = 2
+
+    @dataclass
+    class RewardType:
+        EARLY = "early"
+        NORMAL = "normal"
 
     @log_exec_time
     def compute_reward(
-        self, prev_game_state, cur_game_state, game_result: bool | None = None
+        self,
+        prev_game_state,
+        cur_game_state,
+        reward_type: str = RewardType.NORMAL,
+        game_result: bool | None = None,
     ):
         if prev_game_state is None:
             return 0, {}
 
-        # 结果奖励
-        result_reward = 0
-        if game_result is not None:
-            result_reward = self.W_WIN if game_result else self.W_LOSE
-
         self_team = cur_game_state["my_player"]["team"]
+        total_reward_dict = {}
+
+        # 结果奖励
+        if reward_type != RewardManager.RewardType.EARLY:
+            if game_result is not None:
+                result_reward = self.W_WIN if game_result else self.W_LOSE
+                total_reward_dict["result_reward"] = result_reward
 
         # 占领奖励
-        prev_occupied_grids = _count_occupied_grids(prev_game_state, self_team)
-        cur_occupied_grids = _count_occupied_grids(cur_game_state, self_team)
-        occupy_reward = (cur_occupied_grids - prev_occupied_grids) * self.W_OCCUPY
+        if reward_type != RewardManager.RewardType.EARLY:
+            prev_occupied_grids = _count_occupied_grids(prev_game_state, self_team)
+            cur_occupied_grids = _count_occupied_grids(cur_game_state, self_team)
+            occupy_reward = (cur_occupied_grids - prev_occupied_grids) * self.W_OCCUPY
+            total_reward_dict["occupy_reward"] = occupy_reward
 
         # 眩晕惩罚
         stun_reward = 0
@@ -248,25 +265,29 @@ class RewardManager:
                 and cur_all_players[i]["status"] == PlayerState.BAD
             ):
                 stun_reward += self.W_STUN
+        total_reward_dict["stun_reward"] = stun_reward
 
         # 破坏障碍物奖励
         destroy_obstacle_reward = self._compute_destroy_obstacle_reward(
             prev_game_state, cur_game_state, self_team
         )
+        total_reward_dict["destroy_obstacle_reward"] = destroy_obstacle_reward
 
-        total_reward = (
-            result_reward + occupy_reward + stun_reward + destroy_obstacle_reward
-        )
+        # 放置有效炸弹奖励
+        if reward_type == RewardManager.RewardType.EARLY:
+            place_good_bomb_reward = self._compute_place_good_bomb_reward(
+                cur_game_state, self_team
+            )
+            total_reward_dict["place_good_bomb_reward"] = place_good_bomb_reward
+
+        total_reward = sum(total_reward_dict.values())
 
         return total_reward, {
+            "reward_type": reward_type,
             "total_reward": total_reward,
-            "result_reward": result_reward,
-            "occupy_reward": occupy_reward,
-            "stun_reward": stun_reward,
-            "destroy_obstacle_reward": destroy_obstacle_reward,
+            **total_reward_dict,
         }
 
-    @log_exec_time
     def _compute_destroy_obstacle_reward(
         self, prev_game_state, cur_game_state, self_team
     ) -> float:
@@ -299,6 +320,38 @@ class RewardManager:
                             break
 
         return destroy_obstacle_reward
+
+    def _compute_place_good_bomb_reward(self, cur_game_state, self_team):
+        """
+        如果新放置的炸弹爆炸范围中有可摧毁障碍，直接给予奖励
+        """
+        place_good_bomb_reward = 0
+        for bomb in cur_game_state["bombs"]:
+            if bomb["team"] != self_team:
+                continue
+
+            # explode_at 与当前 tick 差距在 1 以内认为是新炸弹
+            if bomb["explode_at"] - cur_game_state["current_tick"] >= (BOMB_DELAY - 1):
+                bomb_x, bomb_y = bomb["position"]["x"], bomb["position"]["y"]
+                directions = [
+                    (0, 1),
+                    (0, -1),
+                    (1, 0),
+                    (-1, 0),
+                ]
+                for dx, dy in directions:
+                    for i in range(1, bomb["range"] + 1):
+                        grid_x, grid_y = bomb_x + dx * i, bomb_y + dy * i
+                        if not (0 <= grid_x < Map.WIDTH and 0 <= grid_y < Map.HEIGHT):
+                            break
+                        terrain = cur_game_state["map"][grid_y][grid_x]["terrain"]
+                        if terrain == Terrain.OBSTACLE:
+                            break
+                        if terrain == Terrain.DESTROYABLE_OBSTACLE:
+                            place_good_bomb_reward += self.W_PLACE_GOOD_BOMB
+                            break
+
+        return place_good_bomb_reward
 
 
 def _is_in_grid_center(x_or_y: int) -> bool:

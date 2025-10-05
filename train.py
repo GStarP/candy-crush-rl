@@ -62,13 +62,69 @@ class TimeoutMaskCallback(BaseCallback):
         return True
 
 
+class MetricsCallback(BaseCallback):
+    """Aggregate simple domain metrics and push to tensorboard.
+
+    Metrics:
+        - custom/good_bomb_rate: fraction of steps in rollout where place_good_bomb_reward>0
+        - custom/destroy_obstacle_sum: sum of destroy_obstacle_reward in rollout
+        - custom/stun_event_rate: fraction of steps with stun_reward < 0
+    Assumes env info contains reward_detail dict.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.reset_accumulators()
+
+    def reset_accumulators(self):
+        self.good_bomb_events = 0
+        self.destroy_obstacle_sum = 0.0
+        self.stun_events = 0
+        self.total_steps = 0
+
+    def _on_rollout_start(self) -> None:  # type: ignore[override]
+        self.reset_accumulators()
+
+    def _on_step(self) -> bool:  # type: ignore[override]
+        infos = self.locals.get("infos")
+        if not infos:
+            return True
+        # SB3 with non-vec env: infos is a tuple/list len 1
+        if isinstance(infos, (list, tuple)):
+            iterable = infos
+        else:
+            iterable = [infos]
+        for info in iterable:
+            rd = info.get("reward_detail")
+            if rd:
+                if rd.get("place_good_bomb_reward", 0) > 0:
+                    self.good_bomb_events += 1
+                self.destroy_obstacle_sum += rd.get("destroy_obstacle_reward", 0.0)
+                if rd.get("stun_reward", 0) < 0:
+                    self.stun_events += 1
+            self.total_steps += 1
+        return True
+
+    def _on_rollout_end(self) -> bool:  # type: ignore[override]
+        if self.total_steps > 0:
+            good_bomb_rate = self.good_bomb_events / self.total_steps
+            stun_rate = self.stun_events / self.total_steps
+        else:
+            good_bomb_rate = 0.0
+            stun_rate = 0.0
+        self.logger.record("custom/good_bomb_rate", good_bomb_rate)
+        self.logger.record(
+            "custom/destroy_obstacle_sum", float(self.destroy_obstacle_sum)
+        )
+        self.logger.record("custom/stun_rate", stun_rate)
+        return True
+
+
 if __name__ == "__main__":
     SEED = 42
     DEBUG = False
-    RESUME_MODEL_PATH = (
-        "./temp/train_20250929_155551/models/ppo_sugarfight_ckpt_91800_steps.zip"
-    )
-    TOTAL_STEPS = 54000
+    RESUME_MODEL_PATH = ""
+    TOTAL_STEPS = 18000
 
     work_dir = f"./temp/train_{time.strftime('%Y%m%d_%H%M%S', time.localtime())}"
     os.makedirs(work_dir, exist_ok=True)
@@ -92,6 +148,8 @@ if __name__ == "__main__":
     )
     timeout_mask_callback = TimeoutMaskCallback()
 
+    metrics_callback = MetricsCallback()
+
     # 使用自定义 CNN 特征提取器，兼容自定义的观察空间
     from custom_cnn import SugarGridCNN
 
@@ -114,6 +172,15 @@ if __name__ == "__main__":
             seed=SEED,
             tensorboard_log=tensorboard_dir,
             device="cuda",
+            # * 超参数
+            n_steps=512,
+            batch_size=512,
+            learning_rate=2.5e-4,
+            ent_coef=0.04,
+            gamma=0.995,
+            clip_range=0.2,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
         )
         reset_num_timesteps = True
 
@@ -123,7 +190,7 @@ if __name__ == "__main__":
     model.learn(
         total_timesteps=TOTAL_STEPS,
         progress_bar=True,
-        callback=[checkpoint_callback],
+        callback=[checkpoint_callback, timeout_mask_callback, metrics_callback],
         reset_num_timesteps=reset_num_timesteps,
     )
     model.save(os.path.join(model_dir, "A_ppo_sugarfight_ckpt"))
